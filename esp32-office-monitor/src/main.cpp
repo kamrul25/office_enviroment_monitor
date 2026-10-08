@@ -1,0 +1,485 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include "config.h"
+#include <WiFiClientSecure.h>
+
+// ================================================================
+//  OBJECTS & CLIENTS (Adaptive Network Layout)
+// ================================================================
+WiFiClient lowSecureClient;        // Used if MQTT_PORT is 1883
+WiFiClientSecure highSecureClient; // Used if MQTT_PORT is 8883
+PubSubClient mqtt;                 // Initialized dynamically in setup()
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ================================================================
+//  DATA STRUCTS
+// ================================================================
+struct DHTData {
+    float temp = 0;
+    float humidity = 0;
+    float heatIndex = 0;
+    String comfort = "INIT"; 
+    String tip = "";
+    bool valid = false;
+};
+
+struct GasData {
+    int rawADC = 0;
+    String level = "INIT"; 
+    String trend = "STABLE";
+    int history[10] = {};
+    int histIdx = 0;
+    bool warmedUp = false;
+};
+
+struct SmokeData {
+    bool detected = false;
+    unsigned long firstDetectedMs = 0;
+    bool persistAlert = false; 
+};
+
+struct FireData {
+    bool detected = false;
+};
+
+struct LightData {
+    int rawADC = 0;
+    int lux = 0; 
+    String scene = "DARK";
+    String advisory = "";
+};
+
+struct RelayData {
+    bool on = false;
+    unsigned long allClearMs = 0;
+    bool allClearTimer = false;
+};
+
+DHTData dhtData;
+GasData gasData;
+SmokeData smokeData;
+FireData fireData;
+LightData lightData;
+RelayData relayState;
+
+// ================================================================
+//  TIMING & SYSTEM CONTROL
+// ================================================================
+unsigned long lastSensorRead = 0;
+unsigned long lastMqttPublish = 0;
+unsigned long lastMqttRetry = 0;
+unsigned long startMs = 0;
+
+// ================================================================
+//  RELAY CONTROL
+// ================================================================
+void setRelay(bool on) {
+    relayState.on = on;
+    bool pinLevel = RELAY_ACTIVE_LOW ? !on : on;
+    digitalWrite(RELAY_PIN, pinLevel);
+    Serial.printf("[Hardware] Relay state changed to: %s\n", on ? "ON" : "OFF");
+}
+
+// ================================================================
+//  NON-BLOCKING BUZZER ENGINE
+// ================================================================
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+enum AlarmLevel {
+    ALARM_OFF,
+    ALARM_GAS_WARN,
+    ALARM_SMOKE_STAGE1,
+    ALARM_SMOKE_STAGE2,
+    ALARM_FIRE
+};
+AlarmLevel currentAlarm = ALARM_OFF;
+
+void updateBuzzer() {
+    unsigned long now = millis();
+    int intervalOn = 0;
+    int intervalOff = 0;
+
+    switch (currentAlarm) {
+        case ALARM_FIRE:         intervalOn = 80;  intervalOff = 50;  break; 
+        case ALARM_SMOKE_STAGE2: intervalOn = 300; intervalOff = 150; break; 
+        case ALARM_SMOKE_STAGE1: intervalOn = 100; intervalOff = 900; break; 
+        case ALARM_GAS_WARN:     intervalOn = 200; intervalOff = 400; break; 
+        case ALARM_OFF:
+        default:
+            digitalWrite(BUZZER_PIN, LOW);
+            buzzerState = false;
+            return;
+    }
+
+    if (buzzerState) {
+        if (now - lastBuzzerToggle >= intervalOn) {
+            digitalWrite(BUZZER_PIN, LOW);
+            buzzerState = false;
+            lastBuzzerToggle = now;
+        }
+    } else {
+        if (now - lastBuzzerToggle >= intervalOff) {
+            digitalWrite(BUZZER_PIN, HIGH);
+            buzzerState = true;
+            lastBuzzerToggle = now;
+        }
+    }
+}
+
+// ================================================================
+//  WIFI (Safe Non-Blocking Boot Mode)
+// ================================================================
+void connectWiFi() {
+    Serial.printf("[Network] Connecting to WiFi SSID: %s\n", WIFI_SSID);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int tries = 0;
+    // Cap verification block at 6 seconds maximum to protect core loop operation
+    while (WiFi.status() != WL_CONNECTED && tries < 12) {
+        delay(500);
+        Serial.print(".");
+        tries++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[Network] WiFi OK. IP Assignment: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\n[Network] WiFi Timeout during boot. Operating in Offline Safety Mode.");
+    }
+    delay(500);
+}
+
+// ================================================================
+//  MQTT CORE
+// ================================================================
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+    Serial.printf("[MQTT] Message arrived on topic: %s\n", topic);
+}
+
+bool mqttConnect() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    
+    Serial.println("[MQTT] Connecting to broker...");
+    bool ok = mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
+                           TOPIC_STATUS, 0, true, "offline");
+    if (ok) {
+        mqtt.publish(TOPIC_STATUS, "online", true);
+        Serial.println("[MQTT] Cloud link established successfully.");
+    } else {
+        Serial.printf("[MQTT] Connection failed, rc=%d\n", mqtt.state());
+    }
+    return ok;
+}
+
+void ensureMqtt() {
+    if (mqtt.connected()) return;
+    if (WiFi.status() != WL_CONNECTED) return; // Prevent network stall if WiFi dropped out
+    
+    unsigned long now = millis();
+    if (now - lastMqttRetry < MQTT_RECONNECT_MS) return;
+    lastMqttRetry = now;
+    mqttConnect();
+}
+
+// ================================================================
+//  SENSORS
+// ================================================================
+void readDHT() {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (isnan(t) || isnan(h)) {
+        dhtData.valid = false;
+        Serial.println("[DHT22] Data acquisition failure");
+        return;
+    }
+    dhtData.temp = t;
+    dhtData.humidity = h;
+    dhtData.heatIndex = dht.computeHeatIndex(t, h, false);
+    dhtData.valid = true;
+
+    bool tempOk = (t >= 20.0f && t <= 25.0f);
+    bool humOk = (h >= 40.0f && h <= 60.0f);
+
+    if (tempOk && humOk) {
+        dhtData.comfort = "IDEAL";
+        dhtData.tip = "Office conditions optimal";
+    } else if (t > 27.0f || h > 70.0f) {
+        dhtData.comfort = "UNCOMFORTABLE";
+        dhtData.tip = (t > 27.0f) ? "Lower AC setpoint by 2C" : "Increase ventilation";
+    } else {
+        dhtData.comfort = "ACCEPTABLE";
+        if (t < 20.0f) dhtData.tip = "Raise heating by 1-2C";
+        else if (h < 40.0f) dhtData.tip = "Consider a humidifier";
+        else dhtData.tip = "Monitor conditions";
+    }
+}
+
+String gasLevelStr(int adc) {
+    if (adc < GAS_SAFE_MAX) return "SAFE";
+    if (adc < GAS_WARN_MAX) return "WARNING";
+    return "DANGER";
+}
+
+void readMQ35() {
+    gasData.rawADC = analogRead(MQ35_PIN);
+
+    if (millis() - startMs < MQ35_WARMUP_MS) {
+        gasData.level = "WARMING_UP";
+        return;
+    }
+    gasData.warmedUp = true;
+    gasData.level = gasLevelStr(gasData.rawADC);
+
+    gasData.history[gasData.histIdx % 10] = gasData.rawADC;
+    gasData.histIdx++;
+    if (gasData.histIdx > 100) {
+        gasData.histIdx = 10 + (gasData.histIdx % 10);
+    }
+
+    if (gasData.histIdx >= 5) {
+        int oldAvg = 0, newAvg = 0;
+        int n = min(gasData.histIdx, 10);
+        for (int i = 0; i < n / 2; i++) oldAvg += gasData.history[(gasData.histIdx - n + i) % 10];
+        for (int i = n / 2; i < n; i++) newAvg += gasData.history[(gasData.histIdx - n + i) % 10];
+        oldAvg /= max(n / 2, 1);
+        newAvg /= max(n - n / 2, 1);
+        int delta = newAvg - oldAvg;
+        if (delta > 50) gasData.trend = "RISING";
+        else if (delta < -50) gasData.trend = "FALLING";
+        else gasData.trend = "STABLE";
+    }
+}
+
+void readSmoke() {
+    int raw = digitalRead(SMOKE_PIN);
+    bool active = SMOKE_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+    unsigned long now = millis();
+
+    if (active) {
+        if (!smokeData.detected) {
+            smokeData.detected = true;
+            smokeData.firstDetectedMs = now;
+            smokeData.persistAlert = false;
+            if (mqtt.connected()) mqtt.publish(TOPIC_ALERT, "Smoke detected!");
+        }
+        if (!smokeData.persistAlert && (now - smokeData.firstDetectedMs > 10000)) {
+            smokeData.persistAlert = true;
+            if (mqtt.connected()) mqtt.publish(TOPIC_ALERT, "CRITICAL: Persistent smoke");
+        }
+    } else {
+        smokeData.detected = false;
+        smokeData.persistAlert = false;
+    }
+}
+
+void readFire() {
+    int raw = digitalRead(FIRE_PIN);
+    bool active = FIRE_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+
+    if (active && !fireData.detected) {
+        char alert[96];
+        snprintf(alert, sizeof(alert), "FIRE DETECTED! Uptime=%lus", millis() / 1000);
+        if (mqtt.connected()) mqtt.publish(TOPIC_ALERT, alert, false);
+    }
+    fireData.detected = active;
+}
+
+void readLDR() {
+    lightData.rawADC = analogRead(LDR_PIN);
+    lightData.lux = (int)(50.0f * ((float)lightData.rawADC / 4095.0f) * 1000.0f);
+    lightData.lux = constrain(lightData.lux, 0, 100000);
+
+    if (lightData.rawADC < LDR_DARK_MAX)       lightData.scene = "DARK";
+    else if (lightData.rawADC < LDR_DIM_MAX)  lightData.scene = "DIM";
+    else                                       lightData.scene = "BRIGHT";
+
+    if (lightData.scene == "DARK")       lightData.advisory = "Lights off / blinds closed";
+    else if (lightData.scene == "DIM")  lightData.advisory = "Consider raising lights";
+    else                                lightData.advisory = "Good ambient lighting";
+}
+
+// ================================================================
+//  UNIFIED SAFETY LOGIC: PROCESSOR
+// ================================================================
+void updateSafetySystem() {
+    unsigned long now = millis();
+    AlarmLevel targetAlarm = ALARM_OFF;
+    bool systemRequiresRelay = false;
+
+    if (fireData.detected) {
+        targetAlarm = ALARM_FIRE;
+        systemRequiresRelay = true;
+    } else if (smokeData.persistAlert) {
+        targetAlarm = ALARM_SMOKE_STAGE2;
+        systemRequiresRelay = true;
+    } else if (gasData.level == "DANGER" || (gasData.level == "WARNING" && gasData.trend == "RISING")) {
+        targetAlarm = ALARM_GAS_WARN;
+        systemRequiresRelay = true;
+        if (gasData.level == "DANGER" && mqtt.connected() && !relayState.on) {
+            mqtt.publish(TOPIC_ALERT, "DANGER: High gas concentration!");
+        }
+    } else if (smokeData.detected) {
+        targetAlarm = ALARM_SMOKE_STAGE1;
+    }
+
+    currentAlarm = targetAlarm;
+
+    if (systemRequiresRelay) {
+        if (!relayState.on) setRelay(true);
+        relayState.allClearTimer = false;
+    } else if (relayState.on) {
+        if (!relayState.allClearTimer) {
+            relayState.allClearMs = now;
+            relayState.allClearTimer = true;
+        } else if (now - relayState.allClearMs > 30000) {
+            setRelay(false);
+            relayState.allClearTimer = false;
+            if (mqtt.connected()) mqtt.publish(TOPIC_ALERT, "All clear - relay OFF");
+        }
+    }
+}
+
+// ================================================================
+//  MQTT TRANSPORTER
+// ================================================================
+void publishMQTT() {
+    if (!mqtt.connected()) return;
+    char buf[20];
+
+    if (dhtData.valid) {
+        dtostrf(dhtData.temp, 5, 1, buf);      mqtt.publish(TOPIC_TEMP, buf);
+        dtostrf(dhtData.humidity, 5, 1, buf);  mqtt.publish(TOPIC_HUMIDITY, buf);
+        dtostrf(dhtData.heatIndex, 5, 1, buf); mqtt.publish(TOPIC_HEAT_IDX, buf);
+    }
+
+    snprintf(buf, sizeof(buf), "%d", gasData.rawADC);
+    mqtt.publish(TOPIC_GAS_PPM, buf);
+    mqtt.publish(TOPIC_GAS_LEVEL, gasData.level.c_str());
+    mqtt.publish(TOPIC_SMOKE, smokeData.detected ? "SMOKE_DETECTED" : "CLEAR");
+    mqtt.publish(TOPIC_FIRE, fireData.detected ? "FIRE_DETECTED" : "CLEAR");
+
+    snprintf(buf, sizeof(buf), "%d", lightData.lux);
+    mqtt.publish(TOPIC_LIGHT_LUX, buf);
+    mqtt.publish(TOPIC_LIGHT_SCENE, lightData.scene.c_str());
+    mqtt.publish(TOPIC_RELAY, relayState.on ? "ON" : "OFF");
+
+    #if ARDUINOJSON_VERSION_MAJOR >= 7
+        JsonDocument doc;
+    #else
+        StaticJsonDocument<768> doc;
+    #endif
+
+    doc["device"] = MQTT_CLIENT_ID;
+    doc["uptime_s"] = (int)(millis() / 1000);
+    doc["temperature"]["celsius"] = round(dhtData.temp * 10) / 10.0;
+    doc["temperature"]["humidity"] = round(dhtData.humidity * 10) / 10.0;
+    doc["temperature"]["comfort"] = dhtData.comfort;
+    doc["gas"]["raw_adc"] = gasData.rawADC;
+    doc["gas"]["level"] = gasData.level;
+    doc["smoke"] = smokeData.detected;
+    doc["fire"] = fireData.detected;
+    doc["relay_on"] = relayState.on;
+
+    // doc["ldr"]["raw_adc"] = lightData.rawADC;
+    doc["ldr"]["raw"] = lightData.rawADC;
+    doc["ldr"]["status"] = lightData.scene;
+    doc["ldr"]["lux"] = lightData.lux;
+
+    char jsonBuf[512];
+    serializeJson(doc, jsonBuf, sizeof(jsonBuf));
+    mqtt.publish(TOPIC_JSON, jsonBuf);
+}
+
+// ================================================================
+//  INITIALIZATION (SETUP)
+// ================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(250); // Allow hardware lines to stabilize
+    startMs = millis();
+    Serial.println("\n\n=== [System Boot] ESP32 Office Environmental Monitor ===");
+
+    // 1. HARDWARE OUTPUT CONFIGURATION
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+
+    // 2. IMMEDIATE HARDWARE VERIFICATION CHIME
+    Serial.println("[Hardware] Initializing audio diagnostics tone...");
+    digitalWrite(BUZZER_PIN, HIGH); delay(80);
+    digitalWrite(BUZZER_PIN, LOW);  delay(60);
+    digitalWrite(BUZZER_PIN, HIGH); delay(80);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // 3. HARDWARE INPUT CONFIGURATION
+    pinMode(SMOKE_PIN, INPUT_PULLUP);
+    pinMode(FIRE_PIN, INPUT_PULLUP);
+    pinMode(MQ35_PIN, INPUT);
+    pinMode(LDR_PIN, INPUT);
+
+    // 4. SENSOR INITIALIZATION
+    dht.begin();
+
+    // 5. ADAPTIVE NETWORK CONTROLLER CONFIGURATION
+    if (MQTT_PORT == 8883) {
+        Serial.println("[Network] Secure Mode Detected (Port 8883). Allocating TLS Client Stack.");
+        highSecureClient.setInsecure();
+        mqtt.setClient(highSecureClient);
+    } else {
+        Serial.println("[Network] Unencrypted Mode Detected (Port 1883). Allocating standard TCP Stack.");
+        mqtt.setClient(lowSecureClient);
+    }
+    mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+    mqtt.setCallback(mqttCallback);
+    mqtt.setKeepAlive(60);
+    mqtt.setBufferSize(1024);
+
+    // 6. SAFE WIFI ACQUISITION STEP
+    connectWiFi();
+
+    Serial.println("[System Initialization Completed] Entering Runtime Loop.");
+}
+
+// ================================================================
+//  MAIN LOOP
+// ================================================================
+void loop() {
+    unsigned long now = millis();
+
+    // Background network handlers
+    ensureMqtt();
+    if (mqtt.connected()) {
+        mqtt.loop();
+    }
+
+    // 1. Sensor Processing Pipeline (Every 3 seconds)
+    if (now - lastSensorRead >= SENSOR_READ_MS) {
+        lastSensorRead = now;
+        readDHT();
+        readMQ35();
+        readSmoke();
+        readFire();
+        readLDR();
+        updateSafetySystem();
+    }
+
+    // 2. Audio Waveform Alternator (High-speed background process)
+    updateBuzzer();
+
+    // 3. Cloud Synchronization Engine (Every 5 seconds)
+    if (now - lastMqttPublish >= MQTT_PUBLISH_MS) {
+        lastMqttPublish = now;
+        publishMQTT();
+    }
+
+    delay(5);
+}
