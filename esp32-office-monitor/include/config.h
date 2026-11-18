@@ -1,8 +1,8 @@
 #pragma once
 
 // ── WiFi ──────────────────────────────────────────────────────
-#define WIFI_SSID        "Innovation Lab"  
-#define WIFI_PASSWORD    "ilab@diu123"    
+#define WIFI_SSID        "Bro's House"  
+#define WIFI_PASSWORD    "#8888@8888#"    
 
 // ── MQTT ──────────────────────────────────────────────────────
 #define MQTT_SERVER      "a797be32ae124864a802354324c114e3.s1.eu.hivemq.cloud" 
